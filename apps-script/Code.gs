@@ -38,6 +38,19 @@ var DRAFT_HEADERS = ['Токен', 'День', 'Изменён', 'JSON'];
 
 var TOTAL_DAYS = 31;
 
+/** Столбец «День»: C на листе «Ответы», B на листе «Черновики». Столбец «№» — D. */
+var A_DAY = 3, A_NUM = 4, D_DAY = 2;
+
+/** Порядок дней курса: DAY_ORDER[№ - 1] === идентификатор дня. */
+var DAY_ORDER = [
+  '1-1','1-2','1-3','1-4','1-5',
+  '2-1','2-2','2-3','2-4','2-5',
+  '3-1','3-2','3-3','3-4','3-5','3-6',
+  '4-1','4-2','4-3','4-4','4-5',
+  '5-1','5-2','5-3','5-4','5-5',
+  '6-1','6-2','6-3','6-4','6-5'
+];
+
 /* ──────────────────────────── Меню таблицы ─────────────────────────── */
 
 function onOpen() {
@@ -52,6 +65,7 @@ function onOpen() {
     .addItem('📋 Скопировать ссылку выбранного ученика', 'showSelectedLink')
     .addItem('🔗 Выдать ссылки всем без токена', 'fillMissingTokens')
     .addItem('👥 Связать учеников с наставниками', 'linkStudentsToMentors')
+    .addItem('🧩 Починить столбец «День»', 'repairDayColumns')
     .addItem('🔄 Пересчитать прогресс', 'recalcProgress')
     .addToUi();
 }
@@ -60,6 +74,9 @@ function onOpen() {
 
 function setupSheets() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  var existing = ss.getSheetByName(SH_STUDENTS);
+  var migrated = existing ? migrateStudents_(existing) : false;
 
   var st = ensureSheet_(ss, SH_STUDENTS, STUDENT_HEADERS);
   var widths = [200, 160, 160, 150, 190, 360, 140, 100, 150, 260];
@@ -88,11 +105,54 @@ function setupSheets() {
   cf.setColumnWidth(1, 160);
   cf.setColumnWidth(2, 520);
 
+  fillDefaultRoles_(mn);
+  fixDayColumns_();
   refreshValidation_();
 
-  SpreadsheetApp.getUi().alert('Готово',
-    'Листы созданы и настроены.\n\nДальше:\n② Указать адрес сайта\n🔑 Добавить наставника\n➕ Добавить ученика',
-    SpreadsheetApp.getUi().ButtonSet.OK);
+  var msg;
+  if (migrated) {
+    var r = linkStudents_();
+    msg = 'Таблица обновлена до новой версии.\n\n' +
+          '• Добавлен скрытый столбец D «Ключ наставника» — прежние данные сдвинуты и остались на месте.\n' +
+          '• Связано учеников с наставниками: ' + r.linked + '.\n';
+    if (r.empty) msg += '• Без наставника: ' + r.empty + ' — их видит только администратор.\n';
+    if (r.unknown.length) {
+      msg += '• Не нашёл наставников: ' + r.unknown.join(', ') +
+             '.\n  Добавьте их на лист «Наставники» и выполните «👥 Связать учеников с наставниками».\n';
+    }
+    msg += '\nНичего перенастраивать не нужно: адрес сайта, токены и ссылки сохранены.';
+  } else {
+    msg = 'Листы созданы и настроены.\n\nДальше:\n② Указать адрес сайта\n🔑 Добавить наставника\n➕ Добавить ученика';
+  }
+  SpreadsheetApp.getUi().alert('Готово', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Переход со старой раскладки листа «Ученики» (без столбца «Ключ наставника»).
+ * Вставляет столбец на место D, все прежние данные сдвигаются вправо и сохраняются.
+ */
+function migrateStudents_(sh) {
+  if (sh.getLastColumn() < 5) return false;
+  var h = sh.getRange(1, 1, 1, 5).getValues()[0].map(function (v) { return String(v || '').trim(); });
+  if (h[3] === 'Токен' && h[4] === 'Ссылка для ученика') {
+    sh.insertColumnBefore(S_MKEY);
+    return true;
+  }
+  return false;
+}
+
+/** Пустая «Роль» у наставника означает обычного наставника — проставим явно. */
+function fillDefaultRoles_(mn) {
+  if (!mn || mn.getLastRow() < 2) return;
+  var n = mn.getLastRow() - 1;
+  var roles = mn.getRange(2, M_ROLE, n, 1).getValues();
+  var names = mn.getRange(2, M_NAME, n, 1).getValues();
+  var changed = false;
+  for (var i = 0; i < n; i++) {
+    if (!String(names[i][0] || '').trim()) continue;
+    if (!String(roles[i][0] || '').trim()) { roles[i][0] = ROLE_MENTOR; changed = true; }
+  }
+  if (changed) mn.getRange(2, M_ROLE, n, 1).setValues(roles);
 }
 
 function ensureSheet_(ss, name, headers) {
@@ -358,31 +418,40 @@ function fillMissingTokens() {
 }
 
 /** Проставляет ключ наставника всем строкам, где он пуст, по имени в столбце C. */
+/** Проставляет ключи наставников по именам. Возвращает {linked, empty, unknown[]}. */
+function linkStudents_() {
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SH_STUDENTS);
+  var res = { linked: 0, empty: 0, unknown: [] };
+  if (!sh || sh.getLastRow() < 2) return res;
+
+  var n = sh.getLastRow() - 1;
+  var names = sh.getRange(2, S_MENTOR, n, 1).getValues();
+  var keys  = sh.getRange(2, S_MKEY, n, 1).getValues();
+  var rowNames = sh.getRange(2, S_NAME, n, 1).getValues();
+
+  for (var i = 0; i < n; i++) {
+    if (!String(rowNames[i][0] || '').trim()) continue;
+    var nm = String(names[i][0] || '').trim();
+    if (!nm) { keys[i][0] = ''; res.empty++; continue; }
+    var m = findMentorByName_(nm);
+    if (!m) { if (res.unknown.indexOf(nm) < 0) res.unknown.push(nm); continue; }
+    if (keys[i][0] !== m.key) { keys[i][0] = m.key; res.linked++; }
+  }
+  sh.getRange(2, S_MKEY, n, 1).setValues(keys);
+  return res;
+}
+
 function linkStudentsToMentors() {
   var ui = SpreadsheetApp.getUi();
   var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SH_STUDENTS);
   refreshValidation_();
   if (!sh || sh.getLastRow() < 2) { ui.alert('Учеников пока нет.'); return; }
 
-  var n = sh.getLastRow() - 1;
-  var names = sh.getRange(2, S_MENTOR, n, 1).getValues();
-  var keys  = sh.getRange(2, S_MKEY, n, 1).getValues();
-  var linked = 0, unknown = [], empty = 0;
-
-  for (var i = 0; i < n; i++) {
-    var nm = String(names[i][0] || '').trim();
-    if (!nm) { keys[i][0] = ''; empty++; continue; }
-    var m = findMentorByName_(nm);
-    if (!m) { unknown.push(nm); continue; }
-    if (keys[i][0] !== m.key) { keys[i][0] = m.key; linked++; }
-  }
-  sh.getRange(2, S_MKEY, n, 1).setValues(keys);
-
-  var msg = 'Связано записей: ' + linked;
-  if (empty) msg += '\nБез наставника: ' + empty + ' — их видит только администратор.';
-  if (unknown.length) {
-    var uniq = unknown.filter(function (v, i, a) { return a.indexOf(v) === i; });
-    msg += '\n\nНе нашёл таких наставников: ' + uniq.join(', ') +
+  var r = linkStudents_();
+  var msg = 'Связано записей: ' + r.linked;
+  if (r.empty) msg += '\nБез наставника: ' + r.empty + ' — их видит только администратор.';
+  if (r.unknown.length) {
+    msg += '\n\nНе нашёл таких наставников: ' + r.unknown.join(', ') +
            '\nДобавьте их на лист «Наставники» и повторите.';
   }
   ui.alert('Готово', msg, ui.ButtonSet.OK);
@@ -446,6 +515,94 @@ function recalcProgress() {
     return [(counts[tk] || 0) + ' / ' + TOTAL_DAYS, la];
   }));
   SpreadsheetApp.getUi().alert('Готово', 'Прогресс пересчитан.', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/* ─────────────────── Починка столбца «День» ─────────────────── */
+
+/**
+ * Google Sheets распознаёт «1-1» как дату. Приводим столбец к тексту
+ * и переписываем уже испорченные значения обратно в «модуль-день».
+ * Заодно убираем черновики, которые больше не нужны.
+ * Возвращает {answers, drafts, removed}.
+ */
+function fixDayColumns_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var res = { answers: 0, drafts: 0, removed: 0 };
+
+  var an = ss.getSheetByName(SH_ANSWERS);
+  if (an) {
+    an.getRange(2, A_DAY, Math.max(an.getMaxRows() - 1, 1), 1).setNumberFormat('@');
+    if (an.getLastRow() > 1) {
+      var n = an.getLastRow() - 1;
+      var cells = an.getRange(2, A_DAY, n, 2).getValues();   // «День» и «№»
+      var fixed = cells.map(function (c) {
+        var k = dayIdAt_(c[0], c[1]);
+        if (k !== String(c[0]).trim()) res.answers++;
+        return [k];
+      });
+      an.getRange(2, A_DAY, n, 1).setValues(fixed);
+    }
+  }
+
+  var dr = ss.getSheetByName(SH_DRAFTS);
+  if (dr) {
+    dr.getRange(2, D_DAY, Math.max(dr.getMaxRows() - 1, 1), 1).setNumberFormat('@');
+    if (dr.getLastRow() > 1) {
+      // В черновиках нет номера дня, а гадать по дате нельзя — такие строки
+      // просто убираем: черновик восстановится при следующем автосохранении.
+      var dcells = dr.getRange(2, D_DAY, dr.getLastRow() - 1, 1).getValues();
+      for (var k = dcells.length - 1; k >= 0; k--) {
+        if (dcells[k][0] instanceof Date) { dr.deleteRow(k + 2); res.drafts++; }
+      }
+      res.removed = dropStaleDrafts_();
+    }
+  }
+  return res;
+}
+
+/** Удаляет черновики уже отправленных дней и черновики несуществующих учеников. */
+function dropStaleDrafts_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dr = ss.getSheetByName(SH_DRAFTS);
+  var an = ss.getSheetByName(SH_ANSWERS);
+  var st = ss.getSheetByName(SH_STUDENTS);
+  if (!dr || dr.getLastRow() < 2) return 0;
+
+  var submitted = {};
+  if (an && an.getLastRow() > 1) {
+    an.getRange(2, 1, an.getLastRow() - 1, A_DAY).getValues().forEach(function (r) {
+      submitted[String(r[0]).trim() + '|' + dayKey_(r[A_DAY - 1])] = true;
+    });
+  }
+  var alive = {};
+  if (st && st.getLastRow() > 1) {
+    st.getRange(2, S_TOKEN, st.getLastRow() - 1, 1).getValues().forEach(function (r) {
+      var t = String(r[0]).trim();
+      if (t) alive[t] = true;
+    });
+  }
+
+  var rows = dr.getRange(2, 1, dr.getLastRow() - 1, D_DAY).getValues();
+  var removed = 0;
+  for (var i = rows.length - 1; i >= 0; i--) {
+    var tk = String(rows[i][0]).trim();
+    var key = tk + '|' + dayKey_(rows[i][D_DAY - 1]);
+    if (!alive[tk] || submitted[key]) { dr.deleteRow(i + 2); removed++; }
+  }
+  return removed;
+}
+
+function repairDayColumns() {
+  var ui = SpreadsheetApp.getUi();
+  var r = fixDayColumns_();
+  var msg = 'Столбец «День» приведён к тексту.\n\n' +
+    '• Исправлено строк в «Ответах»: ' + r.answers + '\n' +
+    '• Удалено испорченных черновиков: ' + r.drafts + '\n' +
+    '• Удалено ненужных черновиков: ' + r.removed;
+  if (r.answers || r.drafts) {
+    msg += '\n\nТеперь прогресс учеников и ответы в панели наставника отображаются правильно.';
+  }
+  ui.alert('Готово', msg, ui.ButtonSet.OK);
 }
 
 /* ──────────────────────────── Веб-приложение ───────────────────────── */
@@ -512,7 +669,7 @@ function answersFor_(token) {
     if (String(rows[i][0]).trim() !== token) continue;
     var data = {};
     try { data = JSON.parse(rows[i][8] || '{}'); } catch (err) { data = {}; }
-    out[String(rows[i][2]).trim()] = { answers: data, submittedAt: toIso_(rows[i][6]), row: i + 2 };
+    out[dayIdAt_(rows[i][2], rows[i][3])] = { answers: data, submittedAt: toIso_(rows[i][6]), row: i + 2 };
   }
   return out;
 }
@@ -526,9 +683,40 @@ function draftsFor_(token) {
     if (String(rows[i][0]).trim() !== token) continue;
     var data = {};
     try { data = JSON.parse(rows[i][3] || '{}'); } catch (err) { data = {}; }
-    out[String(rows[i][1]).trim()] = { answers: data, updatedAt: toIso_(rows[i][2]) };
+    out[dayKey_(rows[i][1])] = { answers: data, updatedAt: toIso_(rows[i][2]) };
   }
   return out;
+}
+
+/**
+ * Идентификатор дня («1-1» … «6-5»).
+ *
+ * Google Sheets распознаёт такие строки как даты и молча превращает «1-1»
+ * в 1 января, сохраняя при этом исходный вид ячейки. Поэтому на чтении
+ * дату разворачиваем обратно: месяц = модуль, число = день модуля.
+ */
+function dayKey_(v) {
+  if (v instanceof Date) return (v.getMonth() + 1) + '-' + v.getDate();
+  return String(v == null ? '' : v).trim();
+}
+
+/**
+ * Надёжное восстановление идентификатора дня.
+ *
+ * Если ячейка стала датой, разбирать её по месяцу и числу нельзя: «1-2»
+ * в одной региональной настройке — 2 января, в другой — 1 февраля. Поэтому
+ * берём номер дня из столбца «№» — это обычное число и оно однозначно.
+ */
+function dayIdAt_(cell, num) {
+  if (!(cell instanceof Date)) return String(cell == null ? '' : cell).trim();
+  var n = Number(num);
+  if (n >= 1 && n <= DAY_ORDER.length) return DAY_ORDER[n - 1];
+  return dayKey_(cell);
+}
+
+/** Записывает идентификатор дня как текст, чтобы Sheets его не переделал. */
+function writeDay_(sh, row, col, dayId) {
+  sh.getRange(row, col).setNumberFormat('@').setValue(dayId);
 }
 
 function toIso_(v) {
@@ -569,14 +757,18 @@ function apiSubmit_(p) {
       now, String(p.readable || ''), JSON.stringify(p.answers || {})
     ];
 
+    var target;
     if (existing[dayId]) {
-      an.getRange(existing[dayId].row, 1, 1, 9).setValues([row]);
+      target = existing[dayId].row;
+      an.getRange(target, 1, 1, 9).setValues([row]);
     } else {
       an.appendRow(row);
-      an.getRange(an.getLastRow(), 7).setNumberFormat('dd.MM.yyyy HH:mm');
-      an.getRange(an.getLastRow(), 8).setWrap(true).setVerticalAlignment('top');
-      an.getRange(an.getLastRow(), 1, 1, 9).setVerticalAlignment('top');
+      target = an.getLastRow();
+      an.getRange(target, 7).setNumberFormat('dd.MM.yyyy HH:mm');
+      an.getRange(target, 8).setWrap(true).setVerticalAlignment('top');
+      an.getRange(target, 1, 1, 9).setVerticalAlignment('top');
     }
+    writeDay_(an, target, A_DAY, dayId);
 
     clearDraft_(token, dayId);
 
@@ -604,11 +796,12 @@ function apiDraft_(p) {
   if (sh.getLastRow() > 1) {
     var rows = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
     for (var i = 0; i < rows.length; i++) {
-      if (String(rows[i][0]).trim() === token && String(rows[i][1]).trim() === dayId) { found = i + 2; break; }
+      if (String(rows[i][0]).trim() === token && dayKey_(rows[i][1]) === dayId) { found = i + 2; break; }
     }
   }
   if (found > 0) sh.getRange(found, 1, 1, 4).setValues([[token, dayId, now, payload]]);
-  else sh.appendRow([token, dayId, now, payload]);
+  else { sh.appendRow([token, dayId, now, payload]); found = sh.getLastRow(); }
+  writeDay_(sh, found, D_DAY, dayId);
   return { ok: true };
 }
 
@@ -617,7 +810,7 @@ function clearDraft_(token, dayId) {
   if (!sh || sh.getLastRow() < 2) return;
   var rows = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
   for (var i = rows.length - 1; i >= 0; i--) {
-    if (String(rows[i][0]).trim() === token && String(rows[i][1]).trim() === dayId) sh.deleteRow(i + 2);
+    if (String(rows[i][0]).trim() === token && dayKey_(rows[i][1]) === dayId) sh.deleteRow(i + 2);
   }
 }
 
@@ -644,7 +837,7 @@ function apiMentor_(p) {
       var tk = String(rows[i][0]).trim();
       if (!tk) continue;
       if (!byToken[tk]) byToken[tk] = { days: {}, last: null };
-      byToken[tk].days[String(rows[i][2]).trim()] = toIso_(rows[i][6]);
+      byToken[tk].days[dayIdAt_(rows[i][2], rows[i][3])] = toIso_(rows[i][6]);
       var d = rows[i][6];
       if (d instanceof Date && (!byToken[tk].last || d > byToken[tk].last)) byToken[tk].last = d;
     }
