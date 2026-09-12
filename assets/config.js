@@ -7,6 +7,6 @@
       если оставить пустым, нигде не появится.
    ============================================================ */
 window.CONFIG = {
-  API_URL: "ВСТАВЬТЕ_СЮДА_АДРЕС_APPS_SCRIPT",
+  API_URL: "https://script.google.com/macros/s/AKfycbzJyQuZxoo_IEz8tk8DZi_9SE1R6_d3l7jmjWYzHEAR9asAIrZ4tbSTmbhr4lRb2YPE/exec",
   ORG: ""
 };
