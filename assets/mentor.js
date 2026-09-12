@@ -8,7 +8,8 @@
   var DAYS = {};
   C.modules.forEach(function (m) { m.days.forEach(function (d) { DAYS[d.id] = d; }); });
 
-  var S = { key: '', mentor: null, students: [], filter: '', open: null, openDay: null, cache: {} };
+  var S = { key: '', mentor: null, students: [], unassigned: 0,
+           filter: '', who: '', open: null, openDay: null, cache: {} };
 
   var $ = function (s, r) { return (r || document).querySelector(s); };
   function el(t, c, h) { var n = document.createElement(t); if (c) n.className = c; if (h != null) n.innerHTML = h; return n; }
@@ -93,10 +94,12 @@
       '<main class="main"><div class="wrap wrap-wide">' +
       '  <div class="m-head"><h1 id="hello"></h1><div class="sub" id="sub2"></div></div>' +
       '  <div class="stats" id="stats"></div>' +
+      '  <div class="notice" id="notice" hidden></div>' +
       '  <div class="toolbar">' +
       '    <div class="search">' + ICON.search +
       '      <input class="input" id="q" placeholder="Поиск по имени" autocomplete="off"></div>' +
       '  </div>' +
+      '  <div class="chips" id="chips" hidden></div>' +
       '  <div class="s-list" id="list"></div>' +
       '</div></main>' +
       '<div class="sheet-back" id="sheetBack"></div>' +
@@ -118,6 +121,8 @@
     paintThemeBtn();
   }
 
+  function isAdmin() { return !!(S.mentor && S.mentor.isAdmin); }
+
   function paintHead() {
     var total = S.students.length;
     var finished = S.students.filter(function (s) { return Object.keys(s.days).length >= C.totalDays; }).length;
@@ -128,15 +133,60 @@
     var sum = S.students.reduce(function (a, s) { return a + Object.keys(s.days).length; }, 0);
 
     $('#hello').textContent = S.mentor && S.mentor.name ? S.mentor.name : 'Ученики';
-    $('#sub2').textContent = total === 0 ? 'Пока нет учеников' :
-      'Учеников: ' + total + ' · дней пройдено всего: ' + sum;
+    $('#sub2').innerHTML =
+      (isAdmin() ? '<span class="role-badge">администратор</span>' : '') +
+      (total === 0
+        ? (isAdmin() ? 'В таблице пока нет учеников' : 'За вами пока не закреплено ни одного ученика')
+        : 'Учеников: ' + total + ' · дней пройдено всего: ' + sum);
     $('#tbSub').textContent = total + ' ' + plural(total, 'ученик', 'ученика', 'учеников');
 
     $('#stats').innerHTML =
-      stat(total, 'Всего учеников') +
+      stat(total, isAdmin() ? 'Всего учеников' : 'Моих учеников') +
       stat(active, 'Активны за неделю') +
       stat(finished, 'Завершили курс') +
       stat(total ? Math.round(sum / total) : 0, 'Дней в среднем');
+
+    var note = $('#notice');
+    if (isAdmin() && S.unassigned > 0) {
+      note.hidden = false;
+      note.innerHTML = ICON.info +
+        '<div><b>' + S.unassigned + ' ' + plural(S.unassigned, 'ученик', 'ученика', 'учеников') +
+        ' без наставника</b>' + (S.unassigned === 1 ? 'Его' : 'Их') +
+        ' видите только вы. Проставьте наставника в столбце «Наставник» на листе «Ученики» ' +
+        '— или откройте меню «📖 Курс → 👥 Связать учеников с наставниками».</div>';
+    } else {
+      note.hidden = true;
+      note.innerHTML = '';
+    }
+
+    paintChips();
+  }
+
+  /** Фильтр по наставникам — только администратору и только когда наставников больше одного. */
+  function paintChips() {
+    var box = $('#chips');
+    if (!isAdmin()) { box.hidden = true; box.innerHTML = ''; return; }
+
+    var names = [], hasNobody = false;
+    S.students.forEach(function (s) {
+      var n = (s.mentor || '').trim();
+      if (!n || !s.mentorKey) { hasNobody = true; return; }
+      if (names.indexOf(n) < 0) names.push(n);
+    });
+    if (names.length + (hasNobody ? 1 : 0) < 2) { box.hidden = true; box.innerHTML = ''; return; }
+    names.sort(function (a, b) { return a.localeCompare(b); });
+
+    var items = [{ v: '', t: 'Все' }].concat(names.map(function (n) { return { v: n, t: n }; }));
+    if (hasNobody) items.push({ v: '\u0000', t: 'Без наставника' });
+
+    box.hidden = false;
+    box.innerHTML = items.map(function (i) {
+      return '<button type="button" class="chip" data-v="' + esc(i.v) + '"' +
+        (S.who === i.v ? ' aria-pressed="true"' : '') + '>' + esc(i.t) + '</button>';
+    }).join('');
+    box.querySelectorAll('.chip').forEach(function (b) {
+      b.onclick = function () { S.who = b.dataset.v; paintChips(); paintList(); };
+    });
   }
   function stat(v, k) { return '<div class="stat"><div class="v">' + v + '</div><div class="k">' + k + '</div></div>'; }
   function plural(n, a, b, c) {
@@ -150,12 +200,17 @@
     var list = $('#list');
     list.innerHTML = '';
     var items = S.students.filter(function (s) {
-      return !S.filter || s.name.toLowerCase().indexOf(S.filter) >= 0;
+      if (S.filter && s.name.toLowerCase().indexOf(S.filter) < 0) return false;
+      if (!S.who) return true;
+      if (S.who === '\u0000') return !s.mentorKey;
+      return (s.mentor || '').trim() === S.who;
     });
     if (!items.length) {
-      list.appendChild(el('div', 'empty', S.students.length
-        ? 'Никого не нашли по запросу «' + esc(S.filter) + '»'
-        : 'Добавьте первого ученика в таблице: меню «📖 Курс → ➕ Добавить ученика»'));
+      list.appendChild(el('div', 'empty',
+        S.filter ? 'Никого не нашли по запросу «' + esc(S.filter) + '»'
+        : S.who ? 'У этого наставника пока нет учеников'
+        : isAdmin() ? 'Добавьте первого ученика в таблице: меню «📖 Курс → ➕ Добавить ученика»'
+        : 'Пока за вами не закреплён ни один ученик.<br>Наставника ученику проставляют в столбце «Наставник» на листе «Ученики».'));
       return;
     }
     items.sort(function (a, b) {
@@ -199,7 +254,9 @@
 
     if (S.cache[s.token]) { paintSheet(null); return; }
     API.get({ action: 'mentorStudent', key: S.key, token: s.token }).then(function (res) {
-      if (res && res.ok) { S.cache[s.token] = res.submitted || {}; if (S.open === s) paintSheet(S.openDay); }
+      if (res && res.ok) { S.cache[s.token] = res.submitted || {}; }
+      else { S.cache[s.token] = {}; if (res && res.error === 'forbidden') toast('Этот ученик закреплён за другим наставником'); }
+      if (S.open === s) paintSheet(S.openDay);
     }).catch(function () {});
   }
 
@@ -362,8 +419,9 @@
         else centered('<h1>Ошибка</h1><p>Не удалось загрузить данные.</p>');
         return;
       }
-      S.mentor = res.mentor;
+      S.mentor = res.mentor || {};
       S.students = res.students || [];
+      S.unassigned = res.unassigned || 0;
       S.cache = {};
       if (!$('#list')) shell();
       paintHead(); paintList();
